@@ -2,10 +2,13 @@
 
 快照语义
 ========
-* 首次查询（不带 ``snapshot_id``）把*当前字段名集合*与*当前全部分片*
+* 首次查询（不带 ``snapshot_id``）把*当前字段名集合*与*当前可供数分片*
   写入 ``snapshots`` / ``snapshot_fields`` / ``snapshot_shards``。
+  可供数分片指 active 且上传时刻严格晚于当前保留水位线的分片
+  （见 :mod:`app.retention`），cutoff 前上传的分片不会因文件仍在而重新供数。
 * 之后的分页、字段改名/删除/新增、新上传乃至进程重启，都不会改变该快照
   看到的字段与分片；读取完全以快照表为准。
+* 被保留期回收退役的快照（status=retired）在元数据与分页接口一律 410 拒绝。
 * 合读按指标身份列对齐：新增指标在旧分片为 NULL；同名复用得到新身份，
   旧分片没有该身份列，同样为 NULL，不会继承旧指标的值。
 """
@@ -17,12 +20,33 @@ from typing import List, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from . import retention
 from .config import FIXED_COLUMNS, INDICATOR_COLUMN_PREFIX, SAMPLED_AT_COLUMN, STATION_COLUMN
-from .models import ConflictError, NotFound
+from .models import ConflictError, GoneError, NotFound
+
+
+def _visible_shard_ids(conn: sqlite3.Connection) -> List[int]:
+    """新快照可见分片：active 且上传时刻严格晚于当前保留水位线。
+
+    cutoff 前（含）上传的分片即使物理文件仍在（被保留快照引用），
+    也不会再进入任何新快照，保证已退役数据不能重新供数。
+    """
+    cutoff = retention.get_active_cutoff(conn)
+    rows = conn.execute(
+        "SELECT shard_id, uploaded_at FROM shards WHERE status = 'active' ORDER BY shard_id"
+    ).fetchall()
+    if cutoff is None:
+        return [int(r["shard_id"]) for r in rows]
+    cutoff_dt = retention.parse_utc(cutoff)
+    return [
+        int(r["shard_id"])
+        for r in rows
+        if retention.parse_utc(r["uploaded_at"]) > cutoff_dt
+    ]
 
 
 def create_snapshot(conn: sqlite3.Connection) -> dict:
-    """在调用方写事务内创建快照，固化当前字段与当前全部分片。"""
+    """在调用方写事务内创建快照，固化当前字段与当前**可供数**分片。"""
     cur = conn.execute("INSERT INTO snapshots DEFAULT VALUES")
     snapshot_id = int(cur.lastrowid)
 
@@ -36,11 +60,11 @@ def create_snapshot(conn: sqlite3.Connection) -> dict:
             (snapshot_id, row["indicator_id"], row["name"], position),
         )
 
-    shards = conn.execute("SELECT shard_id FROM shards ORDER BY shard_id").fetchall()
-    for position, row in enumerate(shards):
+    shard_ids = _visible_shard_ids(conn)
+    for position, shard_id in enumerate(shard_ids):
         conn.execute(
             "INSERT INTO snapshot_shards (snapshot_id, shard_id, position) VALUES (?, ?, ?)",
-            (snapshot_id, row["shard_id"], position),
+            (snapshot_id, shard_id, position),
         )
 
     created_at = conn.execute(
@@ -50,19 +74,26 @@ def create_snapshot(conn: sqlite3.Connection) -> dict:
     return {
         "snapshot_id": snapshot_id,
         "created_at": created_at,
+        "status": "active",
+        "retired_at": None,
         "indicator_names": [r["name"] for r in fields],
         "indicator_ids": [r["indicator_id"] for r in fields],
-        "shard_ids": [r["shard_id"] for r in shards],
+        "shard_ids": shard_ids,
     }
 
 
 def get_snapshot_meta(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     snap = conn.execute(
-        "SELECT snapshot_id, created_at FROM snapshots WHERE snapshot_id = ?",
+        "SELECT snapshot_id, created_at, status, retired_at FROM snapshots WHERE snapshot_id = ?",
         (snapshot_id,),
     ).fetchone()
     if snap is None:
         raise NotFound(f"快照 {snapshot_id} 不存在")
+    if snap["status"] == "retired":
+        # 退役快照明确拒绝；其分片引用已被回收流程移除，不再支持读取
+        raise GoneError(
+            f"快照 {snapshot_id} 已于 {snap['retired_at']} 被保留期回收退役，不再提供读取"
+        )
     fields = conn.execute(
         "SELECT indicator_id, name FROM snapshot_fields "
         "WHERE snapshot_id = ? ORDER BY position",
@@ -75,6 +106,8 @@ def get_snapshot_meta(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     return {
         "snapshot_id": snapshot_id,
         "created_at": snap["created_at"],
+        "status": "active",
+        "retired_at": None,
         "indicator_names": [r["name"] for r in fields],
         "indicator_ids": [r["indicator_id"] for r in fields],
         "shard_ids": [r["shard_id"] for r in shards],

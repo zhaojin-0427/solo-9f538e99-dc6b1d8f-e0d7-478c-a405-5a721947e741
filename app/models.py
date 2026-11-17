@@ -1,10 +1,11 @@
 """Pydantic 响应/请求模型与统一错误类型。"""
 from __future__ import annotations
 
-from typing import List
+from datetime import datetime
+from typing import List, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConflictError(HTTPException):
@@ -12,6 +13,13 @@ class ConflictError(HTTPException):
 
     def __init__(self, detail: str) -> None:
         super().__init__(status_code=409, detail=detail)
+
+
+class GoneError(HTTPException):
+    """资源已退役（410）：例如快照已被回收流程退役，明确拒绝再读。"""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=410, detail=detail)
 
 
 class NotFound(HTTPException):
@@ -73,6 +81,8 @@ class UploadResponse(BaseModel):
 class SnapshotMeta(BaseModel):
     snapshot_id: int
     created_at: str
+    status: str = Field(..., description="快照状态：active 可分页读取；retired 已被回收退役，拒绝读取")
+    retired_at: Optional[str] = Field(None, description="退役时刻（UTC）；存续快照为 null")
     indicator_names: List[str]
     shard_ids: List[int]
 
@@ -87,3 +97,64 @@ class RowPage(BaseModel):
     fixed_columns: List[str]
     indicator_names: List[str] = Field(..., description="快照固化的当前指标名；旧分片没有的指标为 null")
     rows: List[dict]
+
+
+# ---------------------------------------------------------------------------
+# 保留期回收
+# ---------------------------------------------------------------------------
+
+class ReclaimRequest(BaseModel):
+    cutoff: datetime = Field(
+        ...,
+        description=(
+            "UTC 截止时刻（必须带时区且不晚于当前时间）。"
+            "退役该时刻前（含）创建的快照；此后新快照排除该时刻前（含）上传的分片。"
+        ),
+    )
+
+    @field_validator("cutoff")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            # 与业务校验一致抛 409（而非默认 422），明确告知截止时刻的时区要求
+            raise ConflictError("截止时刻 cutoff 必须带时区信息（UTC 偏移或 Z 后缀），不接受无时区时刻")
+        return value
+
+
+class DeletedShardOut(BaseModel):
+    shard_id: int
+    file_path: str
+    row_count: int
+    uploaded_at: str
+
+
+class RetainedShardOut(BaseModel):
+    shard_id: int
+    file_path: str
+    row_count: int
+    uploaded_at: str
+    referenced_by_snapshots: List[int] = Field(
+        ..., description="仍引用该分片的保留（active）快照号"
+    )
+
+
+class ReclaimResponse(BaseModel):
+    cutoff: str = Field(..., description="本次请求规范化后的 UTC 截止时刻")
+    applied: bool = Field(..., description="本次是否真正推进了保留水位线（重复 cutoff 为 false）")
+    retired_snapshot_ids: List[int] = Field(..., description="本次退役的快照号")
+    deleted_shards: List[DeletedShardOut] = Field(..., description="已删除文件与登记的分片")
+    retained_shards: List[RetainedShardOut] = Field(
+        ..., description="截止时刻前但仍被保留快照引用、暂不能删除的分片"
+    )
+    pending_delete_shard_ids: List[int] = Field(
+        ..., description="已标记待删、文件删除中断留待重试的分片"
+    )
+    active_cutoff: Optional[str] = Field(..., description="处理后当前生效的保留水位线（UTC）")
+
+
+class RetentionOut(BaseModel):
+    active_cutoff: Optional[str] = Field(..., description="当前生效保留水位线；从未回收则为 null")
+    active_snapshot_ids: List[int]
+    retired_snapshot_ids: List[int]
+    active_shard_ids: List[int]
+    pending_delete_shard_ids: List[int]

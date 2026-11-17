@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import catalog, ingest, query
+from . import catalog, ingest, query, retention
 from .config import FIXED_COLUMNS, MAX_INDICATORS
 from .db import connect, immediate_transaction, init_db
 from .models import (
@@ -23,7 +23,10 @@ from .models import (
     IndicatorChangeResponse,
     IndicatorOut,
     NotFound,
+    ReclaimRequest,
+    ReclaimResponse,
     RenameRequest,
+    RetentionOut,
     RowPage,
     SchemaOut,
     SnapshotMeta,
@@ -34,6 +37,8 @@ from .models import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 恢复上次进程中断（文件删除中途崩溃/重启）遗留的待删分片，重试清理
+    retention.recover_pending_deletes()
     app.state.write_lock = threading.RLock()
     yield
 
@@ -45,7 +50,8 @@ app = FastAPI(
         "固定站点 + UTC 采样时刻，至多 8 个可空浮点指标的化验表服务。\n\n"
         "- 指标有稳定身份，改名不换身份；同名复用是全新指标，不继承旧值。\n"
         "- 上传 Parquet 必须指定字段版；含已删指标或未知列整次拒绝。\n"
-        "- 首次查询固化字段与分片并返回快照号，之后任何变更/上传/重启都不影响该快照。"
+        "- 首次查询固化字段与分片并返回快照号，之后任何变更/上传/重启都不影响该快照。\n"
+        "- 保留期回收按 UTC 截止时刻退役旧快照、隔离旧分片并安全释放 Parquet 文件。"
     ),
     lifespan=lifespan,
 )
@@ -226,16 +232,61 @@ def get_rows(
     "/snapshots/{snapshot_id}",
     response_model=SnapshotMeta,
     tags=["查询"],
-    summary="查看快照固化的字段与分片",
+    summary="查看快照固化的字段与分片（退役快照返回 410）",
 )
 def get_snapshot(snapshot_id: int, conn=Depends(get_conn)):
     meta = query.get_snapshot_meta(conn, snapshot_id)
     return SnapshotMeta(
         snapshot_id=meta["snapshot_id"],
         created_at=meta["created_at"],
+        status=meta["status"],
+        retired_at=meta["retired_at"],
         indicator_names=meta["indicator_names"],
         shard_ids=meta["shard_ids"],
     )
+
+
+# ---------------------------------------------------------------------------
+# 保留期回收
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/retention/reclaim",
+    response_model=ReclaimResponse,
+    tags=["保留期回收"],
+    summary="按 UTC 截止时刻退役旧快照并释放不再供数的 Parquet 分片",
+)
+def reclaim_snapshots(
+    payload: ReclaimRequest,
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    # 裁决（含水位线推进、快照退役、分片标记）在锁 + 立即事务内完成；
+    # 物理文件删除在事务外、同一把锁内逐个执行，与上传/建快照/读取严格串行。
+    with lock, immediate_transaction(conn):
+        plan = retention.reclaim(conn, payload.cutoff)
+
+    # 无论本次是否推进水位线，都顺带重试清理历史中断遗留的待删分片，
+    # 使“重试可继续清理”在幂等重复提交时同样成立。
+    with lock:
+        deleted = retention.delete_pending_files(conn)
+    plan["deleted_shards"] = deleted
+    # 已删成功的分片不再属于待删集合；仍残留的保留在 pending_delete_shard_ids 中
+    deleted_ids = {d["shard_id"] for d in deleted}
+    plan["pending_delete_shard_ids"] = [
+        sid for sid in plan["pending_delete_shard_ids"] if sid not in deleted_ids
+    ]
+    return ReclaimResponse(**plan)
+
+
+@app.get(
+    "/retention",
+    response_model=RetentionOut,
+    tags=["保留期回收"],
+    summary="查看当前保留水位线与快照/分片存续状态",
+)
+def get_retention(conn=Depends(get_conn)):
+    return RetentionOut(**retention.retention_overview(conn))
 
 
 @app.get("/", include_in_schema=False)

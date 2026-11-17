@@ -30,6 +30,7 @@ def fresh_data_dir():
 
 @pytest.fixture()
 def client():
+    # TestClient 上下文会触发 lifespan：init_db 建表/迁移 + recover_pending_deletes 恢复
     with TestClient(app) as c:
         yield c
 

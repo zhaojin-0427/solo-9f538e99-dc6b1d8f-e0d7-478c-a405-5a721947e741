@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS snapshot_shards (
     PRIMARY KEY (snapshot_id, shard_id)
 );
 
+-- 保留期回收：单调推进的 UTC 截止水位线（单行，id=1）
+CREATE TABLE IF NOT EXISTS retention_cutoff (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    cutoff       TEXT NOT NULL,
+    applied_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 回收审计：每次有效推进一行（重复/更早的 cutoff 不写入）
+CREATE TABLE IF NOT EXISTS reclamation_runs (
+    run_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    cutoff                TEXT NOT NULL,
+    retired_snapshot_ids  TEXT NOT NULL,
+    deleted_shard_ids     TEXT NOT NULL,
+    retained_shard_ids    TEXT NOT NULL,
+    applied_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_indicators_active ON indicators(active);
 CREATE INDEX IF NOT EXISTS idx_version_indicators_version
     ON version_indicators(version_id);
@@ -123,7 +140,7 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
 
 
 def init_db() -> None:
-    """初始化目录与表结构，并写入空的字段版 1。"""
+    """初始化目录与表结构，写入空的字段版 1，并对老库做幂等迁移。"""
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # 清理上次进程崩溃可能残留的临时分片
@@ -132,6 +149,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA_SQL)
+        _migrate(conn)
         row = conn.execute("SELECT COUNT(*) AS n FROM schema_versions").fetchone()
         if row["n"] == 0:
             conn.execute(
@@ -141,3 +159,16 @@ def init_db() -> None:
             conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库幂等迁移：缺失的列逐个补上；SQLite 不支持 ADD COLUMN IF NOT EXISTS。"""
+    snapshot_cols = {r["name"] for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+    shard_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shards)").fetchall()}
+    if "status" not in snapshot_cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if "retired_at" not in snapshot_cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN retired_at TEXT")
+    if "status" not in shard_cols:
+        conn.execute("ALTER TABLE shards ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    conn.commit()
